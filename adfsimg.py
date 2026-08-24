@@ -4,9 +4,10 @@
 """Build an 800K ADFS D-format floppy image (.adf) from a host directory.
 
 The host directory is expected in the RISC OS ",xxx" convention this archive
-uses: a hex suffix is the filetype, ",lxa" marks a file that carried load/exec
-addresses instead (those addresses are not recoverable from the archive), and
-no suffix means the tag was dropped on extraction.
+uses: a hex suffix is the filetype, ",llllllll-eeeeeeee" (hex, as written by
+Arculator/RPCEmu hostfs) gives an untyped file's load and exec addresses,
+",lxa" marks a file that carried load/exec addresses that are not recoverable
+from the archive, and no suffix means the tag was dropped on extraction.
 
   adfsimg.py SRCDIR OUT.adf [--name DISCNAME]
   adfsimg.py --self-test
@@ -107,18 +108,27 @@ def dir_check_byte(d):
 
 
 def parse_name(fname):
-    """Split a host filename into (risc_os_name, filetype).
+    """Split a host filename into (risc_os_name, filetype, load_exec).
 
-    filetype is an int for a ",xxx" hex tag, or None for an untyped file
-    (",lxa", or no suffix at all).
+    filetype is an int for a ",xxx" hex tag; load_exec is a (load, exec)
+    tuple for a ",llllllll-eeeeeeee" suffix, the convention Arculator and
+    RPCEmu hostfs use for an untyped file with explicit addresses -- each
+    side is 1 to 8 hex digits, matching hostfs's own parser. Both are None
+    for an untyped file (",lxa", or no suffix at all).
     """
+    comma = fname.rfind(",")
+    if comma > 0 and "-" in fname[comma + 1:]:
+        lo, hi = fname[comma + 1:].split("-", 1)
+        if (1 <= len(lo) <= 8 and 1 <= len(hi) <= 8 and
+                all(c in "0123456789abcdefABCDEF" for c in lo + hi)):
+            return fname[:comma], None, (int(lo, 16), int(hi, 16))
     if len(fname) > 4 and fname[-4] == ",":
         tag = fname[-3:]
         if all(c in "0123456789abcdefABCDEF" for c in tag):
-            return fname[:-4], int(tag, 16)
+            return fname[:-4], int(tag, 16), None
         if tag.lower() == "lxa":
-            return fname[:-4], None
-    return fname, None
+            return fname[:-4], None, None
+    return fname, None, None
 
 
 APP_BASE = 0x8000            # where a RISC OS application slot starts
@@ -227,7 +237,7 @@ def scan(path, type_text_as_fff, lxa_addr=LXA_ADDR):
             o.children = scan(full, type_text_as_fff, lxa_addr)
             objs.append(o)
         elif os.path.isfile(full):
-            name, ftype = parse_name(fname)
+            name, ftype, addrs = parse_name(fname)
             o = Obj(riscos_name(name), full, False)
             o.length = os.path.getsize(full)
             if ftype is None and type_text_as_fff and fname == name:
@@ -237,7 +247,11 @@ def scan(path, type_text_as_fff, lxa_addr=LXA_ADDR):
                 with open(full, "rb") as fh:
                     if looks_like_text(fh.read(4096)):
                         ftype = 0xFFF
-            if is_lxa(fname):
+            if addrs:
+                # Explicit addresses from the suffix: the one case where the
+                # host name preserves exactly what the catalogue held.
+                o.load, o.exec_ = addrs
+            elif is_lxa(fname):
                 with open(full, "rb") as fh:
                     derived = decompressor_load_addr(fh.read(0x18))
                 o.load = o.exec_ = derived if derived else lxa_addr
@@ -547,13 +561,25 @@ def self_test():
             fails.append("checksum disagrees with alternate form on %r" % (v[:8],))
             break
 
-    ck("type ffb", parse_name("MemLib,ffb"), ("MemLib", 0xFFB))
-    ck("type upper", parse_name("X,FFB"), ("X", 0xFFB))
-    ck("lxa", parse_name("!RunImage,lxa"), ("!RunImage", None))
-    ck("lxa upper", parse_name("X,LXA"), ("X", None))
-    ck("untyped", parse_name("TextFile"), ("TextFile", None))
-    ck("not a tag", parse_name("a,zzz"), ("a,zzz", None))
-    ck("short", parse_name(",ffb"), (",ffb", None))
+    ck("type ffb", parse_name("MemLib,ffb"), ("MemLib", 0xFFB, None))
+    ck("type upper", parse_name("X,FFB"), ("X", 0xFFB, None))
+    ck("lxa", parse_name("!RunImage,lxa"), ("!RunImage", None, None))
+    ck("lxa upper", parse_name("X,LXA"), ("X", None, None))
+    ck("untyped", parse_name("TextFile"), ("TextFile", None, None))
+    ck("not a tag", parse_name("a,zzz"), ("a,zzz", None, None))
+    ck("short", parse_name(",ffb"), (",ffb", None, None))
+    # The ",load-exec" suffix Arculator hostfs writes for untyped files.
+    ck("load-exec", parse_name("Sheepoid,ba60-ba74"),
+       ("Sheepoid", None, (0xBA60, 0xBA74)))
+    ck("load-exec 8 digits", parse_name("X,00008000-ffffba74"),
+       ("X", None, (0x8000, 0xFFFFBA74)))
+    ck("load-exec upper", parse_name("X,BA60-1"), ("X", None, (0xBA60, 1)))
+    ck("load-exec 9 digits", parse_name("X,123456789-1"),
+       ("X,123456789-1", None, None))
+    ck("load-exec not hex", parse_name("X,zz-11"), ("X,zz-11", None, None))
+    ck("load-exec empty side", parse_name("X,-11"), ("X,-11", None, None))
+    ck("load-exec two dashes", parse_name("X,1-2-3"), ("X,1-2-3", None, None))
+    ck("dash without comma", parse_name("A-B"), ("A-B", None, None))
 
     ck("load typed", load_exec(0xFF8, -2208988800.0), (0xFFFFF800, 0))
     ck("load untyped", load_exec(None, 0.0), (0, 0))
@@ -723,10 +749,13 @@ def self_test():
             open(os.path.join(td, n), "wb").write(b"x")
         os.mkdir(os.path.join(td, "Sub"))
         open(os.path.join(td, "Code,lxa"), "wb").write(b"x")
+        open(os.path.join(td, "Loader,ba60-ba74"), "wb").write(b"x")
         scanned = scan(td, False)
-        names = [o.name for o in scanned if o.name != "Code"]
+        names = [o.name for o in scanned if o.name not in ("Code", "Loader")]
         code = [o for o in scanned if o.name == "Code"][0]
+        loader = [o for o in scanned if o.name == "Loader"][0]
     ck("lxa gets an address", (code.load, code.exec_), (LXA_ADDR, LXA_ADDR))
+    ck("suffix addresses kept", (loader.load, loader.exec_), (0xBA60, 0xBA74))
     ck("scan sorts", names, sorted(names, key=sort_key))
     ck("scan sorted order", names, ["!Boot", "Alpha", "middle", "Sub", "zeta"])
 
