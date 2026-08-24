@@ -11,9 +11,13 @@ of floppies.
 
 ```
 debasic.py FILE...                  # faithful, with line numbers
-debasic.py -n -p FILE...            # no line numbers, readable spacing
+debasic.py -p FILE...               # readable spacing
 debasic.py -o OUTDIR FILE...        # mirror a tree
 ```
+
+`-n` drops line numbers. Careful with it: a `GOTO`/`GOSUB`/`RESTORE` target
+*is* a line number, so dropping them leaves those references pointing at
+nothing. `debasic.py` warns when that happens.
 
 Handles two-byte tokens, the `&8D` inline line-number references behind
 `GOTO`/`GOSUB`/`RESTORE`, and inline ARM assembler — where `ORR`/`ANDS`/`EORS`

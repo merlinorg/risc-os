@@ -248,8 +248,10 @@ def _respace(text, asm, depth=0):
             continue
 
         # --- BASIC operators ------------------------------------------------
+        # "+=" and friends are single operators -- splitting them into
+        # "+ =" is wrong, so match the two-character forms first.
         two = text[i:i + 2]
-        if two in ("<=", ">=", "<>", "<<", ">>"):
+        if two in ("<=", ">=", "<>", "<<", ">>", "+=", "-=", "*=", "/="):
             gap()
             out.append(two + " ")
             i += 2
@@ -338,6 +340,7 @@ def detok_line(body, state=None, pretty=False):
             i += 1
         elif c == 0x8D and i + 3 < len(body):
             out.append(str(decode_lineref(body[i + 1:i + 4])))
+            state["linerefs"] = state.get("linerefs", 0) + 1
             i += 4
         elif c in TOK2 and i + 1 < len(body) and body[i + 1] in TOK2[c]:
             w = TOK2[c][body[i + 1]]
@@ -381,10 +384,14 @@ def is_basic(data):
     return len(data) >= 2 and data[0] == 0x0D
 
 
-def detok(data, numbers=True, pretty=False):
-    """Yield detokenised source lines. Raises ValueError on a malformed file."""
+def detok(data, numbers=True, pretty=False, stats=None):
+    """Yield detokenised source lines. Raises ValueError on a malformed file.
+
+    If stats is a dict it is filled in with counts -- currently "linerefs", the
+    number of GOTO/GOSUB/RESTORE targets encoded as &8D line references.
+    """
     lines, i = [], 0
-    state = {"asm": False, "depth": 0}
+    state = {"asm": False, "depth": 0, "linerefs": 0}
     if not is_basic(data):
         raise ValueError("not a tokenised BASIC file (no leading &0D)")
     while i < len(data):
@@ -401,6 +408,8 @@ def detok(data, numbers=True, pretty=False):
         text = detok_line(data[i + 4:i + ln], state, pretty)
         lines.append(("%5d %s" % (num, text)) if numbers else text)
         i += ln
+    if stats is not None:
+        stats["linerefs"] = state["linerefs"]
     return lines
 
 
@@ -515,9 +524,21 @@ def self_test():
        "FOR D% = 47 TO 0 STEP -1")
     PP("sign after equals", b"P=-4", "P = -4")
     PP("minus is operator", b"BASECODE-1", "BASECODE - 1")
+    PP("plus-equals", b"E%+=4", "E% += 4")
+    PP("minus-equals", b"zooe-=1", "zooe -= 1")
     # Colons and commas breathe; quoted text never does.
     PP("colon and comma", b"A=1:B=2", "A = 1: B = 2")
     PP("quotes untouched", b'\xf1"a,b:c"', 'PRINT "a,b:c"')
+
+    # -n on a program with GOTO targets must report the dangling references.
+    prog = (b"\x0d\x00\x0a\x09\xe5\x8d\x54\x62\x41"    # 10 GOTO 290
+            b"\x0d\x01\x22\x05\xe0"                        # 290 END
+            b"\x0d\xff")
+    st = {}
+    check("linerefs counted", detok(prog, numbers=False, stats=st) and
+          st["linerefs"], 1)
+    check("lineref target", detok(prog, numbers=False)[0], "GOTO290")
+    check("numbers kept", detok(prog)[1].strip(), "290 END")
 
     # "*" starts an operating-system command, not a multiplication, and the
     # command runs to end of line -- colons inside it are the command's own.
@@ -560,19 +581,21 @@ def main():
     ap.add_argument("-n", "--no-numbers", action="store_true",
                     help="omit line numbers")
     ap.add_argument("-p", "--pretty", action="store_true",
-                    help="reinsert spaces around keywords for readability "
-                         "(never inside [ ] assembler blocks)")
+                    help="readable spacing: around operators, after commas and "
+                         "colons, after keywords, and between an ARM mnemonic "
+                         "and its operands")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
     if not a.files:
         ap.error("no input files")
-    bad = 0
+    bad = dangling = 0
     for f in a.files:
         try:
+            stats = {}
             lines = detok(open(f, "rb").read(),
-                          numbers=not a.no_numbers, pretty=a.pretty)
+                          numbers=not a.no_numbers, pretty=a.pretty, stats=stats)
         except (ValueError, OSError) as e:
             print("%s: %s" % (f, e), file=sys.stderr)
             bad += 1
@@ -589,6 +612,19 @@ def main():
             if len(a.files) > 1:
                 print("========== %s ==========" % f)
             print("\n".join(lines))
+        # A GOTO/GOSUB/RESTORE target is a line number. Dropping the line
+        # numbers from a program that has them leaves those references pointing
+        # at nothing, so say so rather than quietly producing a listing that
+        # cannot be followed.
+        if a.no_numbers and stats.get("linerefs"):
+            dangling += 1
+            print("%s: %d line-number reference%s, but -n dropped the line "
+                  "numbers they point at" %
+                  (f, stats["linerefs"], "" if stats["linerefs"] == 1 else "s"),
+                  file=sys.stderr)
+    if dangling > 1:
+        print("%d files have line-number references left dangling by -n"
+              % dangling, file=sys.stderr)
     return 1 if bad else 0
 
 
