@@ -1,4 +1,4 @@
-# riscos
+# risc-os
 
 Three standalone Python 3 tools for reading data off 1990s Acorn RISC OS discs.
 No dependencies. Each has a `--self-test`.

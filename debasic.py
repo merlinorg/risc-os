@@ -213,7 +213,14 @@ def _respace(text, asm, depth=0):
                 at_stmt = False
                 continue
 
-        at_stmt = False
+        stmt_start, at_stmt = at_stmt, False
+
+        # "*" at the start of a statement is a command escape -- "*Set X",
+        # "*OpenWin ..." -- and the command runs to the end of the line. It is
+        # not multiplication, and nothing in it should be respaced.
+        if c == "*" and stmt_start:
+            out.append(text[i:])
+            break
 
         if c in ",;":
             out.append(c)
@@ -281,8 +288,9 @@ def _wants_gap_after(word, nxt):
         return False
     # Outside assembler a keyword takes a gap before anything that starts a
     # term -- "TO0" and "THEN?flag" read better split. Not before "(", where
-    # "INT(x)" and "LEN(s)" are how these are always written.
-    return nxt not in " :;,()"
+    # "INT(x)" and "LEN(s)" are how these are always written, and not before
+    # "$" or "%", which finish a name: "REPORT$" is one word, not two.
+    return nxt not in " :;,()$%"
 
 
 def _wants_gap_before(word, prev):
@@ -510,6 +518,15 @@ def self_test():
     # Colons and commas breathe; quoted text never does.
     PP("colon and comma", b"A=1:B=2", "A = 1: B = 2")
     PP("quotes untouched", b'\xf1"a,b:c"', 'PRINT "a,b:c"')
+
+    # "*" starts an operating-system command, not a multiplication, and the
+    # command runs to end of line -- colons inside it are the command's own.
+    PP("star command", b"\xe7\xc8\x98:*OpenWin Make Tertis",
+       "IF QUIT: *OpenWin Make Tertis")
+    PP("star at line start", b"*Set X 1:2", "*Set X 1:2")
+    PP("star is still times", b"A=B*C", "A = B * C")
+    # "$" and "%" finish a name -- REPORT$ is one word.
+    PP("REPORT$", b"\x85\x9f,\xf6$", "ERROR ERR, REPORT$")
 
     # An [Rn] addressing mode must not be mistaken for the end of the
     # assembler block -- if it is, every mnemonic after it gets split, and
