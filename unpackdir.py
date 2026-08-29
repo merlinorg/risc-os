@@ -6,7 +6,9 @@
 Container:  "PACK" | byte 0 | word maxbits-code | root: name\0 load exec count attr
 Entries:    name\0 load exec length attr type [complen]   type 1 = dir (length = entry count)
             complen 0xFFFFFFFF = stored; otherwise LZW (LSB-first, clear 256, first free 258)
-Files are written with RISC OS ,xxx filetype suffixes, as in the extracted trees.
+Files are written with RISC OS ,xxx filetype suffixes, as in the extracted
+trees; an untyped file keeps its load/exec addresses as a ",llllllll-eeeeeeee"
+suffix, the convention Arculator/RPCEmu hostfs (and adfsimg.py) understand.
 """
 import sys, os, struct, argparse
 
@@ -48,10 +50,10 @@ def riscos_mtime(load, exec_):
         return None
     return ((load & 0xFF) << 32 | exec_) / 100.0 - RISCOS_EPOCH
 
-def suffix(load):
+def suffix(load, exec_):
     if (load >> 20) == 0xFFF:
         return ",%03x" % ((load >> 8) & 0xFFF)
-    return ""
+    return ",%x-%x" % (load, exec_)
 
 class Reader:
     def __init__(self, path):
@@ -95,7 +97,7 @@ class Reader:
                 if len(body) != length:
                     self.bad += 1
                     print(f"  !! {os.path.join(outdir, safe)}: got {len(body)}, expected {length}")
-                dest = os.path.join(outdir, safe + suffix(load))
+                dest = os.path.join(outdir, safe + suffix(load, ex))
                 with open(dest, 'wb') as f:
                     f.write(body)
                 mt = riscos_mtime(load, ex)
@@ -127,13 +129,19 @@ def self_test():
 
     # Its datestamp, and its filetype suffix.
     check("mtime", round(riscos_mtime(0xFFFFEB44, 0x901CE2FB)), 735767083)
-    check("suffix feb", suffix(0xFFFFEB44), ",feb")
-    check("suffix none", suffix(0x00008000), "")
+    check("suffix feb", suffix(0xFFFFEB44, 0x901CE2FB), ",feb")
+    # An untyped file's addresses become the ",load-exec" suffix -- these are
+    # Sheepoid's real values from the 1992 !Ba_P archive.
+    check("suffix load-exec", suffix(0x0000A1A8, 0x0000A1BC), ",a1a8-a1bc")
+    check("suffix zero addrs", suffix(0, 0), ",0-0")
 
-    # A hand-built archive: one stored file (complen -1) inside one directory.
-    body = (b"d\0" + struct.pack('<5I', 0xFFFFFD00, 0, 1, 0, 1)
+    # A hand-built archive: a stored typed file (complen -1) and a stored
+    # untyped file, inside one directory.
+    body = (b"d\0" + struct.pack('<5I', 0xFFFFFD00, 0, 2, 0, 1)
             + b"f\0" + struct.pack('<5I', 0xFFFFFD00, 0, 3, 0, 0)
-            + struct.pack('<I', 0xFFFFFFFF) + b"abc")
+            + struct.pack('<I', 0xFFFFFFFF) + b"abc"
+            + b"g\0" + struct.pack('<5I', 0x0000A1A8, 0x0000A1BC, 3, 0, 0)
+            + struct.pack('<I', 0xFFFFFFFF) + b"xyz")
     arc = (b"PACK\0" + struct.pack('<I', 0) + b"root\0"
            + struct.pack('<4I', 0xFFFFFD00, 0, 1, 0) + body)
     import tempfile
@@ -146,6 +154,8 @@ def self_test():
         check("stored member", bad, 0)
         check("stored bytes", open(os.path.join(out, "d", "f,ffd"), 'rb').read(),
               b"abc")
+        check("untyped keeps addresses",
+              open(os.path.join(out, "d", "g,a1a8-a1bc"), 'rb').read(), b"xyz")
 
     if fails:
         print("SELF-TEST FAILED:\n  " + "\n  ".join(fails))
